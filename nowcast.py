@@ -1,482 +1,503 @@
+#!/usr/bin/env python3
+"""
+Phù Cát Air Base (VVPC / Trung đoàn 925) — Automated Weather Nowcast Monitor
+Tích hợp:
+- Radar mưa RainViewer (Universal Blue color table -> dBZ & rain rate mm/h)
+- Vệ tinh hồng ngoại JMA Himawari IR (nhiệt độ đỉnh mây Tb °C)
+- Quan trắc bề mặt METAR VVPC & Open-Meteo (gió, tầm nhìn, trần mây, CAPE)
+- Extrapolation chuyển động ổ mây (hướng, tốc độ km/h, ETA tới tâm sân bay)
+- Cảnh báo đa cấp độ (Level 0 - 5) qua ntfy kèm chống spam (cooldown)
+"""
+
 import argparse
 import datetime as dt
+import io
 import json
 import math
 import os
 import sys
-from io import BytesIO
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image
 
-TZ_VN = ZoneInfo("Asia/Ho_Chi_Minh")
-STATE_FILE = Path(".nowcast_state.json")
+# ==============================================================================
+# CẤU HÌNH TỌA ĐỘ & KHU VỰC GIÁM SÁT (PHÙ CÁT - VVPC / TRUNG ĐOÀN 925)
+# ==============================================================================
+AIRPORT_NAME = "Sân bay Phù Cát (VVPC / Trung đoàn 925)"
+CENTER_LAT = 13.9550
+CENTER_LON = 109.0422
 
-# Tọa độ Sân bay Phù Cát & vùng không phận 15km (kèm tham chiếu KV 50 - KV 58)
-STATION = {
-    "code": "VVPC",
-    "name": "Sân bay Phù Cát (Trung đoàn 925)",
-    "lat": 13.9550,
-    "lon": 109.0422,
-    "airspace_radius_km": 15.0,
+INNER_RADIUS_KM = 15.0   # Vùng trời sân bay & các khu bay lân cận (15 km)
+OUTER_RADIUS_KM = 30.0   # Vành đai cảnh báo sớm ổ dông tiếp cận (30 km)
+
+STATE_FILE = ".nowcast_state.json"
+USER_AGENT = "PhuCat-Nowcast-Monitor/1.0 (VVPC-925)"
+
+# Khoảng thời gian tối thiểu (phút) giữa 2 lần gửi cùng một mức cảnh báo
+COOLDOWN_MINUTES = {
+    5: 15,   # Cấp 5: Nguy hiểm khẩn cấp (dông mạnh / gió giật / mưa rất to tại sân)
+    4: 20,   # Cấp 4: Cảnh báo cao (ổ dông mạnh trong 15km hoặc đang lao thẳng vào sân)
+    3: 30,   # Cấp 3: Cảnh báo trung bình (mưa vừa / dông trong vành đai 15-30km)
+    2: 45,   # Cấp 2: Theo dõi (mưa nhẹ / mây đối lưu phát triển)
+    1: 60,   # Cấp 1: Bản tin định kỳ đầu giờ khi trời tốt
 }
 
-# Tọa độ tham chiếu các khu vực KV 50 - KV 58 quanh Phù Cát (15 km)
-KV_ZONES: Dict[str, Tuple[float, float]] = {
-    "KV 50": (13.9550, 109.0422),
-    "KV 51": (14.0150, 109.0100),
-    "KV 52": (14.0050, 109.0950),
-    "KV 53": (13.9550, 109.1350),
-    "KV 54": (13.8950, 109.1050),
-    "KV 55": (13.8850, 109.0250),
-    "KV 56": (13.9150, 108.9500),
-    "KV 57": (13.9850, 108.9550),
-    "KV 58": (13.9550, 108.9150),
-}
 
-# Ngưỡng cảnh báo (chỉnh tại dict TH đầu file)
-TH: Dict[str, Any] = {
-    "storm_dbz": 45.0,
-    "storm_radius_km": 30.0,
-    "storm_ct_c": -55.0,
-    "approach_window_min": 45,
-    "shower_window_min": 30,
-    "shower_dbz_min": 20.0,
-    "near_station_radius_km": 15.0,
-    "rapid_conv_dbz_30m": 10.0,
-    "rapid_cool_c_30m": 8.0,
-    "cooldown_minutes": {
-        5: 15,
-        4: 20,
-        3: 25,
-        2: 30,
-        1: 45,
-        0: 55,
-    },
-}
-
-# Hiệu chuẩn IR (CAL_WARM / CAL_COLD) giữ như trang web hiện tại
-CAL_WARM: Dict[str, Any] = {
-    "pixel": 235.0,
-    "temp_c": 25.0,
-}
-CAL_COLD: Dict[str, Any] = {
-    "pixel": 25.0,
-    "temp_c": -80.0,
-}
-
-# Bảng màu Universal Blue (RGB -> dBZ gần đúng)
-UNIVERSAL_BLUE_PALETTE: List[Tuple[Tuple[int, int, int], float]] = [
-    ((4, 233, 231), 5.0),
-    ((1, 159, 244), 10.0),
-    ((3, 0, 244), 15.0),
-    ((2, 253, 2), 20.0),
-    ((1, 197, 1), 25.0),
-    ((0, 142, 0), 30.0),
-    ((253, 248, 2), 35.0),
-    ((229, 188, 0), 40.0),
-    ((233, 122, 0), 45.0),
-    ((244, 0, 0), 50.0),
-    ((212, 0, 0), 55.0),
-    ((156, 0, 0), 60.0),
-    ((255, 255, 255), 65.0),
-]
-
-RAINVIEWER_API = "https://api.rainviewer.com/public/weather-maps.json"
-OPEN_METEO_API = "https://api.open-meteo.com/v1/forecast"
-AVIATION_WEATHER_METAR_API = "https://aviationweather.gov/api/data/metar"
-
-
-def now_vn() -> dt.datetime:
-    return dt.datetime.now(TZ_VN)
-
-
+# ==============================================================================
+# HÀM TOÁN HỌC & TỌA ĐỘ ĐỊA LÝ
+# ==============================================================================
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2 - lon1)
-    x = math.sin(dl) * math.cos(p2)
-    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
-    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
-def bearing_to_vi_direction(deg: float) -> str:
+def compass_dir_vi(deg: float) -> str:
     dirs = [
-        "Bắc", "Đông Bắc", "Đông", "Đông Nam",
-        "Nam", "Tây Nam", "Tây", "Tây Bắc",
+        "Bắc", "Bắc Đông Bắc", "Đông Bắc", "Đông Đông Bắc",
+        "Đông", "Đông Đông Nam", "Đông Nam", "Nam Đông Nam",
+        "Nam", "Nam Tây Nam", "Tây Nam", "Tây Tây Nam",
+        "Tây", "Tây Tây Bắc", "Tây Bắc", "Bắc Tây Bắc",
     ]
-    idx = int(((deg + 22.5) % 360.0) // 45.0)
+    idx = int((deg + 11.25) // 22.5) % 16
     return dirs[idx]
 
 
-def offset_latlon(lat: float, lon: float, dist_km: float, brg_deg: float) -> Tuple[float, float]:
-    r = 6371.0
-    ang = dist_km / r
-    brg = math.radians(brg_deg)
-    p1 = math.radians(lat)
-    l1 = math.radians(lon)
-    p2 = math.asin(math.sin(p1) * math.cos(ang) + math.cos(p1) * math.sin(ang) * math.cos(brg))
-    l2 = l1 + math.atan2(
-        math.sin(brg) * math.sin(ang) * math.cos(p1),
-        math.cos(ang) - math.sin(p1) * math.sin(p2),
-    )
-    return math.degrees(p2), ((math.degrees(l2) + 180.0) % 360.0) - 180.0
-
-
-def latlon_to_tile_xy(lat: float, lon: float, zoom: int) -> Tuple[float, float]:
-    lat_c = max(min(lat, 85.05112878), -85.05112878)
+def latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int, float, float]:
+    lat_rad = math.radians(lat)
     n = 2.0 ** zoom
-    x = (lon + 180.0) / 360.0 * n
-    lat_rad = math.radians(lat_c)
-    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
-    return x, y
+    xtile_f = (lon + 180.0) / 360.0 * n
+    ytile_f = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    xtile = int(xtile_f)
+    ytile = int(ytile_f)
+    px = (xtile_f - xtile) * 256.0
+    py = (ytile_f - ytile) * 256.0
+    return xtile, ytile, px, py
 
 
-def rgb_to_dbz_array(rgb: np.ndarray) -> np.ndarray:
-    h, w, _ = rgb.shape
-    dbz = np.full((h, w), np.nan, dtype=np.float32)
-    valid = (rgb[:, :, 0] > 10) | (rgb[:, :, 1] > 10) | (rgb[:, :, 2] > 10)
-    if not np.any(valid):
-        return dbz
-
-    palette_rgb = np.array([c for c, _ in UNIVERSAL_BLUE_PALETTE], dtype=np.float32)
-    palette_val = np.array([v for _, v in UNIVERSAL_BLUE_PALETTE], dtype=np.float32)
-
-    pts = rgb[valid].astype(np.float32)
-    dists = np.linalg.norm(pts[:, None, :] - palette_rgb[None, :, :], axis=2)
-    nearest = np.argmin(dists, axis=1)
-    min_d = dists[np.arange(len(pts)), nearest]
-
-    mapped = np.where(min_d <= 65.0, palette_val[nearest], np.nan)
-    dbz[valid] = mapped
-    return dbz
+def tile_pixel_to_latlon(xtile: int, ytile: int, px: float, py: float, zoom: int) -> Tuple[float, float]:
+    n = 2.0 ** zoom
+    lon = (xtile + px / 256.0) / n * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * (ytile + py / 256.0) / n)))
+    lat = math.degrees(lat_rad)
+    return lat, lon
 
 
-def dbz_to_rain_mm_hr(dbz: float) -> float:
-    if np.isnan(dbz) or dbz < 15.0:
-        return 0.0
-    z = 10.0 ** (dbz / 10.0)
-    return round((z / 200.0) ** (1.0 / 1.6), 1)
-
-
+# ==============================================================================
+# QUẢN LÝ TRẠNG THÁI (STATE & COOLDOWN)
+# ==============================================================================
 def load_state() -> Dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"last_sent": {}, "history": []}
+    if not os.path.exists(STATE_FILE):
+        return {"history": [], "last_sent": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("history", [])
+                data.setdefault("last_sent", {})
+                return data
+    except Exception:
+        pass
+    return {"history": [], "last_sent": {}}
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[WARN] Không thể lưu state: {exc}", file=sys.stderr)
 
 
-def analyze_cell_grid(
-    dbz_grid: np.ndarray,
-    ct_grid: np.ndarray,
-    grid_lat: np.ndarray,
-    grid_lon: np.ndarray,
-) -> Dict[str, Any]:
-    dist_km = haversine_km(STATION["lat"], STATION["lon"], grid_lat, grid_lon)
-    brg_deg = bearing_deg(STATION["lat"], STATION["lon"], grid_lat, grid_lon)
+# ==============================================================================
+# 1. RADAR RAINVIEWER (UNIVERSAL BLUE PALETTE -> dBZ)
+# ==============================================================================
+# Bảng màu chuẩn RainViewer Scheme 2 (Universal Blue) ánh xạ RGB -> dBZ
+RAINVIEWER_PALETTE = [
+    ((136, 221, 238), 10.0),
+    ((0, 153, 255), 15.0),
+    ((0, 102, 204), 20.0),
+    ((0, 187, 0), 25.0),
+    ((0, 136, 0), 30.0),
+    ((255, 238, 0), 35.0),
+    ((255, 170, 0), 40.0),
+    ((255, 102, 0), 45.0),
+    ((238, 0, 0), 50.0),
+    ((187, 0, 0), 55.0),
+    ((255, 0, 255), 60.0),
+    ((153, 51, 204), 65.0),
+]
 
-    valid_dbz = ~np.isnan(dbz_grid)
-    if not np.any(valid_dbz):
-        return {
-            "max_dbz_30km": 0.0,
-            "max_dbz_15km": 0.0,
-            "station_dbz": 0.0,
-            "min_ct_30km": 20.0,
-            "min_ct_15km": 20.0,
-            "strongest_cell": None,
-            "nearest_rain_cell": None,
-        }
 
-    near_st_mask = valid_dbz & (dist_km <= 4.0)
-    station_dbz = float(np.nanmax(dbz_grid[near_st_mask])) if np.any(near_st_mask) else 0.0
+def rgb_array_to_dbz(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Chuyển đổi mảng ảnh RGBA RainViewer sang ma trận phản hồi vô tuyến dBZ."""
+    h, w, _ = rgb.shape
+    dbz = np.zeros((h, w), dtype=np.float32)
+    mask = alpha > 20
+    if not np.any(mask):
+        return dbz
 
-    m15 = valid_dbz & (dist_km <= TH["near_station_radius_km"])
-    m30 = valid_dbz & (dist_km <= TH["storm_radius_km"])
+    valid_rgb = rgb[mask].astype(np.float32)
+    palette_colors = np.array([c[0] for c in RAINVIEWER_PALETTE], dtype=np.float32)
+    palette_dbz = np.array([c[1] for c in RAINVIEWER_PALETTE], dtype=np.float32)
 
-    max_dbz_15km = float(np.nanmax(dbz_grid[m15])) if np.any(m15) else 0.0
-    max_dbz_30km = float(np.nanmax(dbz_grid[m30])) if np.any(m30) else 0.0
+    # Tính khoảng cách màu Euclidean trong không gian RGB
+    diff = valid_rgb[:, None, :] - palette_colors[None, :, :]
+    dist_sq = np.sum(diff ** 2, axis=2)
+    nearest_idx = np.argmin(dist_sq, axis=1)
+    min_dist_sq = dist_sq[np.arange(len(valid_rgb)), nearest_idx]
 
-    valid_ct15 = m15 & (~np.isnan(ct_grid))
-    valid_ct30 = m30 & (~np.isnan(ct_grid))
-    min_ct_15km = float(np.nanmin(ct_grid[valid_ct15])) if np.any(valid_ct15) else 15.0
-    min_ct_30km = float(np.nanmin(ct_grid[valid_ct30])) if np.any(valid_ct30) else 15.0
+    matched_dbz = palette_dbz[nearest_idx]
+    # Loại bỏ nhiễu màu không thuộc bảng radar
+    matched_dbz[min_dist_sq > 8500.0] = 0.0
+    dbz[mask] = matched_dbz
+    return dbz
 
-    strongest_cell = None
-    if np.any(m30):
-        sub_dbz = np.where(m30, dbz_grid, -999.0)
-        idx = np.unravel_index(np.nanargmax(sub_dbz), sub_dbz.shape)
-        c_lat = float(grid_lat[idx])
-        c_lon = float(grid_lon[idx])
-        c_dist = float(dist_km[idx])
-        c_brg = float(brg_deg[idx])
-        c_dbz = float(dbz_grid[idx])
-        c_ct = float(ct_grid[idx]) if not np.isnan(ct_grid[idx]) else 15.0
-        strongest_cell = {
-            "lat": c_lat,
-            "lon": c_lon,
-            "dist_km": round(c_dist, 1),
-            "bearing_deg": round(c_brg, 1),
-            "direction": bearing_to_vi_direction(c_brg),
-            "dbz": round(c_dbz, 1),
-            "cloud_top_c": round(c_ct, 1),
-        }
 
-    nearest_rain_cell = None
-    rain_mask = valid_dbz & (dist_km <= TH["storm_radius_km"]) & (dbz_grid >= TH["shower_dbz_min"])
-    if np.any(rain_mask):
-        sub_dist = np.where(rain_mask, dist_km, 9999.0)
-        idx = np.unravel_index(np.nanargmin(sub_dist), sub_dist.shape)
-        r_lat = float(grid_lat[idx])
-        r_lon = float(grid_lon[idx])
-        r_dist = float(dist_km[idx])
-        r_brg = float(brg_deg[idx])
-        r_dbz = float(dbz_grid[idx])
-        nearest_rain_cell = {
-            "lat": r_lat,
-            "lon": r_lon,
-            "dist_km": round(r_dist, 1),
-            "bearing_deg": round(r_brg, 1),
-            "direction": bearing_to_vi_direction(r_brg),
-            "dbz": round(r_dbz, 1),
-        }
+def dbz_to_rain_rate_mmh(dbz: float) -> float:
+    """Công thức Marshall-Palmer Z = 200 * R^1.6."""
+    if dbz < 10.0:
+        return 0.0
+    z = 10.0 ** (dbz / 10.0)
+    return (z / 200.0) ** (1.0 / 1.6)
 
-    return {
-        "max_dbz_30km": round(max_dbz_30km, 1),
-        "max_dbz_15km": round(max_dbz_15km, 1),
-        "station_dbz": round(station_dbz, 1),
-        "min_ct_30km": round(min_ct_30km, 1),
-        "min_ct_15km": round(min_ct_15km, 1),
-        "strongest_cell": strongest_cell,
-        "nearest_rain_cell": nearest_rain_cell,
+
+def fetch_rainviewer_radar() -> Dict[str, Any]:
+    """Lấy khung radar mới nhất từ RainViewer API và quét vùng 15km & 30km quanh Phù Cát."""
+    result: Dict[str, Any] = {
+        "available": False,
+        "radar_time_utc": None,
+        "max_dbz_15km": 0.0,
+        "mean_dbz_15km": 0.0,
+        "coverage_15km_pct": 0.0,
+        "max_dbz_30km": 0.0,
+        "coverage_30km_pct": 0.0,
+        "strongest_cell": None,
+        "nearest_rain_cell": None,
+    }
+    try:
+        resp = requests.get(
+            "https://api.rainviewer.com/public/weather-maps.json",
+            headers={"User-Agent": USER_AGENT},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        host = data.get("host", "https://tilecache.rainviewer.com")
+        past = data.get("radar", {}).get("past", [])
+        if not past:
+            return result
+
+        latest = past[-1]
+        path = latest["path"]
+        ts = latest["time"]
+        result["radar_time_utc"] = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat()
+
+        # Zoom 8 (~611m/pixel tại vĩ độ 14°N) -> ghép lưới 3x3 tile quanh Phù Cát
+        zoom = 8
+        cx, cy, _, _ = latlon_to_tile(CENTER_LAT, CENTER_LON, zoom)
+        canvas = Image.new("RGBA", (256 * 3, 256 * 3), (0, 0, 0, 0))
+
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                tx, ty = cx + dx, cy + dy
+                tile_url = f"{host}{path}/256/{zoom}/{tx}/{ty}/2/1_1.png"
+                t_resp = requests.get(tile_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+                if t_resp.status_code == 200 and t_resp.content:
+                    tile_img = Image.open(io.BytesIO(t_resp.content)).convert("RGBA")
+                    canvas.paste(tile_img, ((dx + 1) * 256, (dy + 1) * 256))
+
+        arr = np.array(canvas)
+        dbz_grid = rgb_array_to_dbz(arr[:, :, :3], arr[:, :, 3])
+
+        # Lấy mẫu theo bước 2 pixel để tính toán nhanh và chính xác
+        inner_vals: List[float] = []
+        outer_vals: List[float] = []
+        inner_total = 0
+        outer_total = 0
+
+        strongest_cell: Optional[Dict[str, Any]] = None
+        nearest_cell: Optional[Dict[str, Any]] = None
+
+        top_tx, top_ty = cx - 1, cy - 1
+        for py in range(0, 768, 2):
+            for px in range(0, 768, 2):
+                lat, lon = tile_pixel_to_latlon(top_tx, top_ty, float(px), float(py), zoom)
+                dist = haversine_km(CENTER_LAT, CENTER_LON, lat, lon)
+                if dist > OUTER_RADIUS_KM:
+                    continue
+
+                val = float(dbz_grid[py, px])
+                outer_total += 1
+                if val >= 15.0:
+                    outer_vals.append(val)
+
+                if dist <= INNER_RADIUS_KM:
+                    inner_total += 1
+                    if val >= 15.0:
+                        inner_vals.append(val)
+
+                if val >= 15.0:
+                    brg = bearing_deg(CENTER_LAT, CENTER_LON, lat, lon)
+                    cell_info = {
+                        "lat": round(lat, 4),
+                        "lon": round(lon, 4),
+                        "dbz": round(val, 1),
+                        "distance_km": round(dist, 1),
+                        "bearing_deg": round(brg, 0),
+                        "direction_vi": compass_dir_vi(brg),
+                    }
+                    if strongest_cell is None or val > strongest_cell["dbz"] or (
+                        val == strongest_cell["dbz"] and dist < strongest_cell["distance_km"]
+                    ):
+                        strongest_cell = cell_info
+
+                    if nearest_cell is None or dist < nearest_cell["distance_km"]:
+                        nearest_cell = cell_info
+
+        result["available"] = True
+        if inner_total > 0:
+            result["coverage_15km_pct"] = round(len(inner_vals) / inner_total * 100.0, 1)
+        if outer_total > 0:
+            result["coverage_30km_pct"] = round(len(outer_vals) / outer_total * 100.0, 1)
+
+        if inner_vals:
+            result["max_dbz_15km"] = round(max(inner_vals), 1)
+            result["mean_dbz_15km"] = round(sum(inner_vals) / len(inner_vals), 1)
+        if outer_vals:
+            result["max_dbz_30km"] = round(max(outer_vals), 1)
+
+        result["strongest_cell"] = strongest_cell
+        result["nearest_rain_cell"] = nearest_cell
+    except Exception as exc:
+        print(f"[WARN] Lỗi đọc RainViewer radar: {exc}", file=sys.stderr)
+
+    return result
+
+
+# ==============================================================================
+# 2. VỆ TINH HỒNG NGOẠI JMA HIMAWARI IR (NHIỆT ĐỘ ĐỈNH MÂY Tb °C)
+# ==============================================================================
+def fetch_jma_ir_cloud_top() -> Dict[str, Any]:
+    """Lấy nhiệt độ đỉnh mây IR từ JMA Himawari (khu vực SE2 - Biển Đông / Việt Nam)."""
+    result: Dict[str, Any] = {
+        "available": False,
+        "min_tb_c": None,
+        "mean_tb_c": None,
+        "convective_status": "Không xác định",
+    }
+    try:
+        meta_url = "https://www.jma.go.jp/bosai/himawari/data/satimg/targetTimes_fd.json"
+        resp = requests.get(meta_url, headers={"User-Agent": USER_AGENT}, timeout=12)
+        resp.raise_for_status()
+        times = resp.json()
+        if not times:
+            return result
+
+        latest = times[-1]
+        basetime = latest["basetime"]
+        validtime = latest["validtime"]
+
+        # Zoom 4 trên lưới Himawari JMA SE2 phủ khu vực Việt Nam
+        zoom = 4
+        xtile, ytile, px, py = latlon_to_tile(CENTER_LAT, CENTER_LON, zoom)
+        tile_url = (
+            f"https://www.jma.go.jp/bosai/himawari/data/satimg/{basetime}/fd/"
+            f"{validtime}/B13/TBB/{zoom}/{xtile}/{ytile}.jpg"
+        )
+        img_resp = requests.get(tile_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if img_resp.status_code != 200 or not img_resp.content:
+            return result
+
+        img = Image.open(io.BytesIO(img_resp.content)).convert("L")
+        arr = np.array(img, dtype=np.float32)
+
+        cx_i, cy_i = int(round(px)), int(round(py))
+        x0, x1 = max(0, cx_i - 4), min(256, cx_i + 5)
+        y0, y1 = max(0, cy_i - 4), min(256, cy_i + 5)
+        patch = arr[y0:y1, x0:x1]
+        if patch.size == 0:
+            return result
+
+        # Ánh xạ thang xám ảnh IR JMA B13 sang nhiệt độ sáng đỉnh mây Tb (°C):
+        # Pixel sáng (gần 255) tương ứng mây cao lạnh (-80°C), pixel tối (gần 0) tương ứng mặt đất ấm (+30°C)
+        tb_patch = 30.0 - (patch / 255.0) * 110.0
+        min_tb = float(np.min(tb_patch))
+        mean_tb = float(np.mean(tb_patch))
+
+        if min_tb <= -65.0:
+            status = "Cb phát triển cực mạnh / tháp đối lưu xuyên tầng (<-65°C)"
+        elif min_tb <= -52.0:
+            status = "Mây vũ tích Cb đối lưu sâu hoạt động mạnh (-52°C đến -65°C)"
+        elif min_tb <= -35.0:
+            status = "Mây đối lưu trung bình / mây tầng cao dày (-35°C đến -52°C)"
+        elif min_tb <= -15.0:
+            status = "Mây tầng trung / mây dông đang hình thành (-15°C đến -35°C)"
+        else:
+            status = "Quang mây hoặc mây tầng thấp ấm (>-15°C)"
+
+        result["available"] = True
+        result["min_tb_c"] = round(min_tb, 1)
+        result["mean_tb_c"] = round(mean_tb, 1)
+        result["convective_status"] = status
+    except Exception as exc:
+        print(f"[WARN] Lỗi đọc vệ tinh JMA IR: {exc}", file=sys.stderr)
+
+    return result
+
+
+# ==============================================================================
+# 3. QUAN TRẮC BỀ MẶT METAR VVPC & OPEN-METEO
+# ==============================================================================
+def fetch_station_weather_and_metar() -> Dict[str, Any]:
+    """Lấy bản tin METAR mới nhất của VVPC và thông số bề mặt từ Open-Meteo."""
+    weather: Dict[str, Any] = {
+        "metar_raw": None,
+        "temp_c": None,
+        "dewpoint_c": None,
+        "wind_dir_deg": None,
+        "wind_speed_kt": None,
+        "wind_gust_kt": None,
+        "precip_mm": 0.0,
+        "cape_jkg": None,
+        "cloud_cover_pct": None,
+        "visibility_km": None,
+        "weather_code": None,
     }
 
+    # 3A. Lấy METAR VVPC từ Aviation Weather Center (NOAA)
+    try:
+        metar_url = "https://aviationweather.gov/api/data/metar?ids=VVPC&format=json"
+        m_resp = requests.get(metar_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if m_resp.status_code == 200:
+            m_data = m_resp.json()
+            if isinstance(m_data, list) and m_data:
+                latest_m = m_data[0]
+                weather["metar_raw"] = latest_m.get("rawOb")
+                if latest_m.get("temp") is not None:
+                    weather["temp_c"] = float(latest_m["temp"])
+                if latest_m.get("dewp") is not None:
+                    weather["dewpoint_c"] = float(latest_m["dewp"])
+                if latest_m.get("wdir") is not None and str(latest_m["wdir"]).isdigit():
+                    weather["wind_dir_deg"] = int(latest_m["wdir"])
+                if latest_m.get("wspd") is not None:
+                    weather["wind_speed_kt"] = float(latest_m["wspd"])
+                if latest_m.get("wgst") is not None:
+                    weather["wind_gust_kt"] = float(latest_m["wgst"])
+    except Exception as exc:
+        print(f"[WARN] Lỗi đọc METAR VVPC: {exc}", file=sys.stderr)
 
+    # 3B. Bổ sung & đối chiếu từ Open-Meteo (tọa độ Phù Cát)
+    try:
+        om_url = (
+            f"https://api.open-meteo.com/v1/forecast?latitude={CENTER_LAT}&longitude={CENTER_LON}"
+            "&current=temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,rain,showers,"
+            "weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+            "&hourly=cape,visibility&wind_speed_unit=kn&forecast_days=1&timezone=Asia%2FHo_Chi_Minh"
+        )
+        o_resp = requests.get(om_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if o_resp.status_code == 200:
+            o_data = o_resp.json()
+            curr = o_data.get("current", {})
+            if weather["temp_c"] is None and curr.get("temperature_2m") is not None:
+                weather["temp_c"] = float(curr["temperature_2m"])
+            if weather["dewpoint_c"] is None and curr.get("dew_point_2m") is not None:
+                weather["dewpoint_c"] = float(curr["dew_point_2m"])
+            if weather["wind_dir_deg"] is None and curr.get("wind_direction_10m") is not None:
+                weather["wind_dir_deg"] = int(curr["wind_direction_10m"])
+            if weather["wind_speed_kt"] is None and curr.get("wind_speed_10m") is not None:
+                weather["wind_speed_kt"] = float(curr["wind_speed_10m"])
+            if weather["wind_gust_kt"] is None and curr.get("wind_gusts_10m") is not None:
+                weather["wind_gust_kt"] = float(curr["wind_gusts_10m"])
+
+            weather["precip_mm"] = float(curr.get("precipitation") or 0.0)
+            weather["cloud_cover_pct"] = curr.get("cloud_cover")
+            weather["weather_code"] = curr.get("weather_code")
+
+            hourly = o_data.get("hourly", {})
+            capes = hourly.get("cape", [])
+            vis_list = hourly.get("visibility", [])
+            now_hour = dt.datetime.now().hour
+            if capes and now_hour < len(capes) and capes[now_hour] is not None:
+                weather["cape_jkg"] = float(capes[now_hour])
+            if vis_list and now_hour < len(vis_list) and vis_list[now_hour] is not None:
+                weather["visibility_km"] = round(float(vis_list[now_hour]) / 1000.0, 1)
+    except Exception as exc:
+        print(f"[WARN] Lỗi đọc Open-Meteo: {exc}", file=sys.stderr)
+
+    return weather
+
+
+# ==============================================================================
+# 4. NGOẠI SUY CHUYỂN ĐỘNG Ổ MÂY (MOTION EXTRAPOLATION)
+# ==============================================================================
 def extrapolate_motion(
     prev_cell: Optional[Dict[str, Any]],
     curr_cell: Optional[Dict[str, Any]],
     dt_minutes: float,
 ) -> Optional[Dict[str, Any]]:
+    """Tính vận tốc, hướng di chuyển ổ mây và ước tính thời gian tới sân bay (ETA)."""
     if not prev_cell or not curr_cell or dt_minutes <= 0:
         return None
 
-    lat1, lon1 = prev_cell["lat"], prev_cell["lon"]
-    lat2, lon2 = curr_cell["lat"], curr_cell["lon"]
-    moved_km = haversine_km(lat1, lon1, lat2, lon2)
-    if moved_km < 0.5:
+    moved_km = haversine_km(
+        prev_cell["lat"], prev_cell["lon"],
+        curr_cell["lat"], curr_cell["lon"],
+    )
+    if moved_km < 0.8:
+        return {
+            "speed_kmh": 0.0,
+            "move_dir_deg": None,
+            "move_dir_vi": "Ít di chuyển / tại chỗ",
+            "approaching": curr_cell["distance_km"] <= INNER_RADIUS_KM,
+            "eta_min": 0 if curr_cell["distance_km"] <= 5.0 else None,
+        }
+
+    speed_kmh = moved_km / (dt_minutes / 60.0)
+    if speed_kmh > 110.0:
+        # Bỏ qua bước nhảy giả do đổi tâm ổ mây khác nhau
         return None
 
-    move_brg = bearing_deg(lat1, lon1, lat2, lon2)
-    speed_kmh = moved_km / (dt_minutes / 60.0)
+    move_brg = bearing_deg(
+        prev_cell["lat"], prev_cell["lon"],
+        curr_cell["lat"], curr_cell["lon"],
+    )
+    to_airport_brg = bearing_deg(
+        curr_cell["lat"], curr_cell["lon"],
+        CENTER_LAT, CENTER_LON,
+    )
+    angle_diff = abs((move_brg - to_airport_brg + 180.0) % 360.0 - 180.0)
+    approaching = angle_diff <= 45.0 or (curr_cell["distance_km"] < prev_cell["distance_km"] - 1.0)
 
-    to_station_brg = bearing_deg(lat2, lon2, STATION["lat"], STATION["lon"])
-    angle_diff = abs(((move_brg - to_station_brg + 180.0) % 360.0) - 180.0)
-    dist_to_station = haversine_km(lat2, lon2, STATION["lat"], STATION["lon"])
-
-    eta_min: Optional[float] = None
-    if angle_diff <= 45.0 and speed_kmh > 3.0:
-        eta_min = (dist_to_station / speed_kmh) * 60.0
+    eta_min: Optional[int] = None
+    if approaching and speed_kmh >= 5.0:
+        eta_min = max(1, int(round((curr_cell["distance_km"] / speed_kmh) * 60.0)))
 
     return {
-        "move_bearing_deg": round(move_brg, 1),
-        "move_direction": bearing_to_vi_direction(move_brg),
         "speed_kmh": round(speed_kmh, 1),
-        "eta_min": round(eta_min, 0) if eta_min is not None else None,
-        "dist_to_station_km": round(dist_to_station, 1),
+        "move_dir_deg": round(move_brg, 0),
+        "move_dir_vi": compass_dir_vi(move_brg),
+        "approaching": approaching,
+        "eta_min": eta_min,
     }
 
 
-def fetch_real_radar_and_ir() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    size = 128
-    half_span_deg = 0.45
-    lats = np.linspace(STATION["lat"] + half_span_deg, STATION["lat"] - half_span_deg, size)
-    lons = np.linspace(STATION["lon"] - half_span_deg, STATION["lon"] + half_span_deg, size)
-    grid_lon, grid_lat = np.meshgrid(lons, lats)
-
-    dbz_grid = np.full((size, size), np.nan, dtype=np.float32)
-    ct_grid = np.full((size, size), np.nan, dtype=np.float32)
-
-    rv_resp = requests.get(RAINVIEWER_API, timeout=20)
-    rv_resp.raise_for_status()
-    rv_data = rv_resp.json()
-    host = rv_data.get("host", "https://tilecache.rainviewer.com")
-    past_frames = rv_data.get("radar", {}).get("past", [])
-    if past_frames:
-        latest_path = past_frames[-1]["path"]
-        zoom = 7
-        tx, ty = latlon_to_tile_xy(STATION["lat"], STATION["lon"], zoom)
-        tile_url = f"{host}{latest_path}/256/{zoom}/{int(tx)}/{int(ty)}/1/1_1.png"
-        t_resp = requests.get(tile_url, timeout=20)
-        t_resp.raise_for_status()
-        img = Image.open(BytesIO(t_resp.content)).convert("RGB")
-        fx = (tx - int(tx)) * 256.0
-        fy = (ty - int(ty)) * 256.0
-        crop_half = 48
-        x0 = max(0, int(fx - crop_half))
-        y0 = max(0, int(fy - crop_half))
-        x1 = min(256, int(fx + crop_half))
-        y1 = min(256, int(fy + crop_half))
-        cropped = img.crop((x0, y0, x1, y1)).resize((size, size), Image.Resampling.BILINEAR)
-        dbz_grid = rgb_to_dbz_array(np.asarray(cropped))
-
-    ir_url = os.environ.get("JMA_IR_URL", "").strip()
-    if ir_url:
-        ir_resp = requests.get(ir_url, timeout=20)
-        ir_resp.raise_for_status()
-        ir_img = Image.open(BytesIO(ir_resp.content)).convert("L")
-        ir_resized = ir_img.resize((size, size), Image.Resampling.BILINEAR)
-        arr = np.asarray(ir_resized, dtype=np.float32)
-        p_warm = float(CAL_WARM["pixel"])
-        t_warm = float(CAL_WARM["temp_c"])
-        p_cold = float(CAL_COLD["pixel"])
-        t_cold = float(CAL_COLD["temp_c"])
-        ratio = np.clip((arr - p_cold) / max(1e-6, (p_warm - p_cold)), 0.0, 1.0)
-        ct_grid = (t_cold + ratio * (t_warm - t_cold)).astype(np.float32)
-
-    return dbz_grid, ct_grid, grid_lat, grid_lon
-
-
-def build_demo_frames() -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]]:
-    size = 128
-    half_span_deg = 0.45
-    lats = np.linspace(STATION["lat"] + half_span_deg, STATION["lat"] - half_span_deg, size)
-    lons = np.linspace(STATION["lon"] - half_span_deg, STATION["lon"] + half_span_deg, size)
-    grid_lon, grid_lat = np.meshgrid(lons, lats)
-
-    c1_lat, c1_lon = offset_latlon(STATION["lat"], STATION["lon"], 35.0, 315.0)
-    c2_lat, c2_lon = offset_latlon(c1_lat, c1_lon, 10.0, 90.0)
-
-    frames = []
-    for clat, clon, peak_dbz, peak_ct, mins_ago in [
-        (c1_lat, c1_lon, 44.0, -52.0, 20.0),
-        (c2_lat, c2_lon, 52.0, -61.0, 0.0),
-    ]:
-        png_img = Image.new("RGB", (size, size), (0, 0, 0))
-        draw = ImageDraw.Draw(png_img)
-        px = int(((clon - (STATION["lon"] - half_span_deg)) / (2 * half_span_deg)) * size)
-        py = int((((STATION["lat"] + half_span_deg) - clat) / (2 * half_span_deg)) * size)
-        color = (212, 0, 0) if peak_dbz >= 50 else (233, 122, 0)
-        r_px = 7
-        draw.ellipse((px - r_px, py - r_px, px + r_px, py + r_px), fill=color)
-
-        gray_val = int(
-            np.interp(
-                peak_ct,
-                [float(CAL_COLD["temp_c"]), float(CAL_WARM["temp_c"])],
-                [float(CAL_COLD["pixel"]), float(CAL_WARM["pixel"])],
-            )
-        )
-        ir_img = Image.new("L", (size, size), int(CAL_WARM["pixel"]))
-        ir_draw = ImageDraw.Draw(ir_img)
-        ir_draw.ellipse((px - r_px - 2, py - r_px - 2, px + r_px + 2, py + r_px + 2), fill=gray_val)
-        jpeg_buf = BytesIO()
-        ir_img.save(jpeg_buf, format="JPEG", quality=92)
-        jpeg_buf.seek(0)
-        decoded_ir = np.asarray(Image.open(jpeg_buf).convert("L"), dtype=np.float32)
-
-        p_warm, t_warm = float(CAL_WARM["pixel"]), float(CAL_WARM["temp_c"])
-        p_cold, t_cold = float(CAL_COLD["pixel"]), float(CAL_COLD["temp_c"])
-        ratio = np.clip((decoded_ir - p_cold) / max(1e-6, (p_warm - p_cold)), 0.0, 1.0)
-        ct_grid = (t_cold + ratio * (t_warm - t_cold)).astype(np.float32)
-        dbz_grid = rgb_to_dbz_array(np.asarray(png_img))
-
-        frames.append((dbz_grid, ct_grid, grid_lat, grid_lon, mins_ago))
-
-    return frames
-
-
-def fetch_station_weather_and_metar() -> Dict[str, Any]:
-    info: Dict[str, Any] = {
-        "temp_c": None,
-        "feels_like_c": None,
-        "humidity": None,
-        "next_3h_summary": "Chưa có dữ liệu dự báo 3 giờ tới",
-        "day_minmax": None,
-        "rain_hours": [],
-        "metar": "METAR VVPC chưa cập nhật",
-    }
-
-    try:
-        params = {
-            "latitude": STATION["lat"],
-            "longitude": STATION["lon"],
-            "current": "temperature_2m,apparent_temperature,relative_humidity_2m",
-            "hourly": "temperature_2m,precipitation_probability,weather_code",
-            "daily": "temperature_2m_max,temperature_2m_min",
-            "timezone": "Asia/Ho_Chi_Minh",
-            "forecast_days": 1,
-        }
-        r = requests.get(OPEN_METEO_API, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        curr = data.get("current", {})
-        info["temp_c"] = curr.get("temperature_2m")
-        info["feels_like_c"] = curr.get("apparent_temperature")
-        info["humidity"] = curr.get("relative_humidity_2m")
-
-        hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
-        probs = hourly.get("precipitation_probability", [])
-        temps = hourly.get("temperature_2m", [])
-
-        now_str = now_vn().strftime("%Y-%m-%dT%H:00")
-        start_idx = 0
-        for i, t_str in enumerate(times):
-            if t_str >= now_str:
-                start_idx = i
-                break
-
-        next3_parts = []
-        for j in range(start_idx, min(start_idx + 3, len(times))):
-            hh = times[j].split("T")[1][:5]
-            t_val = temps[j] if j < len(temps) else "?"
-            p_val = probs[j] if j < len(probs) else 0
-            next3_parts.append(f"{hh}: {t_val}°C, mưa {p_val}%")
-        if next3_parts:
-            info["next_3h_summary"] = " | ".join(next3_parts)
-
-        rain_hours = []
-        for j, t_str in enumerate(times):
-            p_val = probs[j] if j < len(probs) else 0
-            if p_val is not None and p_val >= 40:
-                rain_hours.append(f"{t_str.split('T')[1][:5]} ({p_val}%)")
-        info["rain_hours"] = rain_hours
-
-        daily = data.get("daily", {})
-        d_max = (daily.get("temperature_2m_max") or [None])[0]
-        d_min = (daily.get("temperature_2m_min") or [None])[0]
-        if d_min is not None and d_max is not None:
-            info["day_minmax"] = (d_min, d_max)
-    except Exception:
-        pass
-
-    try:
-        m_resp = requests.get(AVIATION_WEATHER_METAR_API, params={"ids": STATION["code"], "format": "raw"}, timeout=12)
-        if m_resp.ok and m_resp.text.strip():
-            info["metar"] = m_resp.text.strip().splitlines()[0]
-    except Exception:
-        pass
-
-    return info
-
-
+# ==============================================================================
+# 5. ĐÁNH GIÁ MỨC ĐỘ CẢNH BÁO & SOẠN BẢN TIN NOWCAST
+# ==============================================================================
 def evaluate_alert(
     curr_stats: Dict[str, Any],
     prev_stats: Optional[Dict[str, Any]],
@@ -484,192 +505,330 @@ def evaluate_alert(
     weather: Dict[str, Any],
     now_dt: dt.datetime,
 ) -> Optional[Dict[str, Any]]:
-    strongest = curr_stats.get("strongest_cell")
-    nearest_rain = curr_stats.get("nearest_rain_cell")
-    max_dbz_30 = curr_stats.get("max_dbz_30km", 0.0)
-    min_ct_30 = curr_stats.get("min_ct_30km", 20.0)
-    station_dbz = curr_stats.get("station_dbz", 0.0)
+    radar = curr_stats.get("radar", {})
+    ir = curr_stats.get("ir", {})
 
-    if max_dbz_30 >= TH["storm_dbz"] and min_ct_30 <= TH["storm_ct_c"] and strongest:
-        return {
-            "level": 5,
-            "key": "storm_active",
-            "ntfy_priority": "urgent",
-            "title": f"DÔNG ĐANG XẢY RA — {STATION['name']}",
-            "body": (
-                f"Echo {strongest['dbz']} dBZ, đỉnh mây {strongest['cloud_top_c']}°C, "
-                f"cách {strongest['dist_km']} km hướng {strongest['direction']}."
-            ),
-        }
+    max15 = float(radar.get("max_dbz_15km") or 0.0)
+    cov15 = float(radar.get("coverage_15km_pct") or 0.0)
+    max30 = float(radar.get("max_dbz_30km") or 0.0)
+    strong_cell = radar.get("strongest_cell")
+    near_cell = radar.get("nearest_rain_cell")
 
-    if (
-        strongest
-        and strongest["dbz"] >= TH["storm_dbz"]
-        and motion
-        and motion.get("eta_min") is not None
-        and 0 < motion["eta_min"] <= TH["approach_window_min"]
+    min_tb = ir.get("min_tb_c")
+    gust_kt = float(weather.get("wind_gust_kt") or 0.0)
+    wspd_kt = float(weather.get("wind_speed_kt") or 0.0)
+    precip_mm = float(weather.get("precip_mm") or 0.0)
+    cape = float(weather.get("cape_jkg") or 0.0)
+    wcode = int(weather.get("weather_code") or 0)
+
+    has_thunder_code = wcode in (95, 96, 99)
+    approaching = bool(motion and motion.get("approaching"))
+    eta_min = motion.get("eta_min") if motion else None
+
+    # Phân cấp mức độ nguy hiểm (Level 5 -> Level 1)
+    level = 0
+    key = "level_0"
+    headline = ""
+
+    if max15 >= 45.0 or (max15 >= 40.0 and gust_kt >= 25.0) or (has_thunder_code and max15 >= 35.0):
+        level = 5
+        key = "level_5_severe"
+        headline = "CẢNH BÁO KHẨN CẤP: DÔNG MẠNH / MƯA RẤT TO TẠI VÙNG TRỜI PHÙ CÁT"
+    elif (
+        max15 >= 35.0
+        or (max30 >= 45.0 and approaching)
+        or (min_tb is not None and min_tb <= -58.0 and max30 >= 30.0)
+        or gust_kt >= 28.0
     ):
-        eta = int(motion["eta_min"])
-        return {
-            "level": 4,
-            "key": "storm_approaching",
-            "ntfy_priority": "high",
-            "title": f"DÔNG SẮP TỚI (~{eta} PHÚT) — {STATION['code']}",
-            "body": (
-                f"Ô echo {strongest['dbz']} dBZ (cách {strongest['dist_km']} km hướng {strongest['direction']}), "
-                f"di chuyển hướng {motion['move_direction']} ~{motion['speed_kmh']} km/h, dự kiến tới sau ~{eta} phút."
-            ),
-        }
+        level = 4
+        key = "level_4_high"
+        headline = "CẢNH BÁO CAO: Ổ DÔNG MẠNH TRONG 15KM HOẶC ĐANG TIẾP CẬN VVPC"
+    elif (
+        max15 >= 25.0
+        or max30 >= 35.0
+        or (min_tb is not None and min_tb <= -45.0 and (max30 >= 20.0 or cape >= 1200.0))
+        or gust_kt >= 22.0
+    ):
+        level = 3
+        key = "level_3_moderate"
+        headline = "CẢNH BÁO TRUNG BÌNH: MƯA RÀO / ĐỐI LƯU HOẠT ĐỘNG QUANH PHÙ CÁT"
+    elif max15 >= 15.0 or max30 >= 20.0 or precip_mm >= 0.5:
+        level = 2
+        key = "level_2_watch"
+        headline = "THEO DÕI THỜI TIẾT: XUẤT HIỆN MƯA NHẸ / MÂY ĐỐI LƯU LÂN CẬN"
+    elif now_dt.minute < 10:
+        # Gửi bản tin xác nhận trạng thái trời tốt vào đầu mỗi giờ
+        level = 1
+        key = f"level_1_hourly_{now_dt.strftime('%Y%m%d_%H')}"
+        headline = "BẢN TIN ĐỊNH KỲ: THỜI TIẾT KHU VỰC PHÙ CÁT ỔN ĐỊNH"
+    else:
+        return None
 
-    if prev_stats and prev_stats.get("strongest_cell") and strongest:
-        prev_c = prev_stats["strongest_cell"]
-        dbz_gain = strongest["dbz"] - prev_c.get("dbz", strongest["dbz"])
-        ct_cooling = prev_c.get("cloud_top_c", strongest["cloud_top_c"]) - strongest["cloud_top_c"]
-        if dbz_gain >= TH["rapid_conv_dbz_30m"] or ct_cooling >= TH["rapid_cool_c_30m"]:
-            return {
-                "level": 3,
-                "key": "rapid_convection",
-                "ntfy_priority": "high",
-                "title": f"ĐỐI LƯU PHÁT TRIỂN NHANH — {STATION['code']}",
-                "body": (
-                    f"Echo {strongest['dbz']} dBZ (tăng {dbz_gain:+.1f} dBZ), đỉnh mây {strongest['cloud_top_c']}°C "
-                    f"(lạnh đi {ct_cooling:+.1f}°C), cách {strongest['dist_km']} km hướng {strongest['direction']}."
-                ),
-            }
+    # Soạn nội dung chi tiết chuẩn nghiệp vụ khí tượng hàng không
+    lines: List[str] = [
+        f"Thời điểm: {now_dt.strftime('%H:%M %d/%m/%Y')} (Giờ địa phương)",
+        f"Khu vực: {AIRPORT_NAME} (Bán kính giám sát 15km / 30km)",
+        "",
+        "1. RADAR THỜI TIẾT (RAINVIEWER):",
+    ]
 
-    if nearest_rain:
-        near_station = nearest_rain["dist_km"] <= TH["near_station_radius_km"]
-        eta_rain = int(motion["eta_min"]) if (motion and motion.get("eta_min") is not None) else None
-        approaching_30m = eta_rain is not None and 0 < eta_rain <= TH["shower_window_min"]
-        if near_station or approaching_30m:
-            eta_txt = f"tới sau ~{eta_rain} phút" if eta_rain else f"cách {nearest_rain['dist_km']} km hướng {nearest_rain['direction']}"
-            return {
-                "level": 2,
-                "key": "shower_alert",
-                "ntfy_priority": "default",
-                "title": f"MƯA RÀO BẤT CHỢT — {STATION['code']}",
-                "body": f"Echo {nearest_rain['dbz']} dBZ ({eta_txt}) trong vùng giám sát {STATION['name']}.",
-            }
-
-    if station_dbz >= 15.0:
-        mm_hr = dbz_to_rain_mm_hr(station_dbz)
-        return {
-            "level": 1,
-            "key": "rain_at_station",
-            "ntfy_priority": "low",
-            "title": f"ĐANG MƯA TẠI {STATION['code']}",
-            "body": f"Phản hồi radar tại trạm ~{station_dbz} dBZ, cường độ mưa ước tính ~{mm_hr} mm/giờ.",
-        }
-
-    if 5 <= now_dt.hour <= 22:
-        radar_line = (
-            f"Radar: echo cao nhất 30 km là {max_dbz_30} dBZ; IR đỉnh mây thấp nhất {min_ct_30}°C."
-            if max_dbz_30 > 0
-            else f"Radar/IR: không có echo mưa đáng kể trong 30 km; đỉnh mây thấp nhất {min_ct_30}°C."
+    if radar.get("available"):
+        lines.append(
+            f"- Trong 15km: Max {max15:.0f} dBZ (~{dbz_to_rain_rate_mmh(max15):.1f} mm/h), "
+            f"độ phủ mưa {cov15:.1f}%"
         )
-        lines = [
-            f"Nhiệt độ: {weather.get('temp_c', '?')}°C | Cảm giác: {weather.get('feels_like_c', '?')}°C | Độ ẩm: {weather.get('humidity', '?')}%",
-            f"3 giờ tới: {weather.get('next_3h_summary')}",
-            f"METAR: {weather.get('metar')}",
-            radar_line,
-        ]
-        if now_dt.hour == 6:
-            d_mm = weather.get("day_minmax")
-            mm_txt = f"{d_mm[0]}°C – {d_mm[1]}°C" if d_mm else "N/A"
-            r_hrs = weather.get("rain_hours") or []
-            r_txt = ", ".join(r_hrs) if r_hrs else "ít khả năng mưa"
-            lines.append(f"Cả ngày: {mm_txt} | Giờ có khả năng mưa: {r_txt}")
+        lines.append(
+            f"- Trong 30km: Max {max30:.0f} dBZ, độ phủ mưa {radar.get('coverage_30km_pct', 0.0):.1f}%"
+        )
+        if strong_cell:
+            lines.append(
+                f"- Tâm phản hồi mạnh nhất: {strong_cell['dbz']:.0f} dBZ cách sân bay "
+                f"{strong_cell['distance_km']:.1f} km về hướng {strong_cell['direction_vi']} "
+                f"({strong_cell['bearing_deg']:.0f}°)"
+            )
+        if near_cell and near_cell != strong_cell:
+            lines.append(
+                f"- Vùng mưa gần nhất: {near_cell['dbz']:.0f} dBZ cách {near_cell['distance_km']:.1f} km "
+                f"hướng {near_cell['direction_vi']}"
+            )
+        if prev_stats and prev_stats.get("radar", {}).get("available"):
+            prev_max15 = float(prev_stats["radar"].get("max_dbz_15km") or 0.0)
+            delta = max15 - prev_max15
+            if abs(delta) >= 3.0:
+                trend_str = f"tăng +{delta:.0f} dBZ" if delta > 0 else f"giảm {delta:.0f} dBZ"
+                lines.append(f"- Xu thế 10 phút qua (15km): {trend_str}")
+    else:
+        lines.append("- Dữ liệu radar tạm thời gián đoạn, đang theo dõi qua vệ tinh & mặt đất.")
 
-        return {
-            "level": 0,
-            "key": f"hourly_{now_dt.strftime('%Y%m%d_%H')}",
-            "ntfy_priority": "low",
-            "title": f"BẢN TIN {now_dt.strftime('%H:%M')} — {STATION['name']}",
-            "body": "\n".join(lines),
-        }
+    if motion:
+        lines.append("")
+        lines.append("2. DỊCH CHUYỂN Ổ MÂY (EXTRAPOLATION):")
+        if motion["speed_kmh"] > 0:
+            eta_txt = f" | Dự kiến tới sân bay sau ~{eta_min} phút" if eta_min else ""
+            approach_txt = "ĐANG HƯỚNG VỀ SÂN BAY" if approaching else "Di chuyển lệch hướng sân bay"
+            lines.append(
+                f"- Hướng di chuyển: {motion['move_dir_vi']} ({motion['move_dir_deg']:.0f}°), "
+                f"tốc độ ~{motion['speed_kmh']:.0f} km/h ({approach_txt}{eta_txt})"
+            )
+        else:
+            lines.append(f"- Trạng thái dịch chuyển: {motion['move_dir_vi']}")
 
-    return None
+    lines.append("")
+    lines.append("3. VỆ TINH IR & QUAN TRẮC BỀ MẶT:")
+    if ir.get("available") and min_tb is not None:
+        lines.append(f"- Đỉnh mây JMA IR: Min Tb = {min_tb:.1f}°C ({ir['convective_status']})")
+
+    wind_parts = []
+    if weather.get("wind_dir_deg") is not None:
+        wind_parts.append(f"hướng {weather['wind_dir_deg']}°")
+    if wspd_kt > 0:
+        wind_parts.append(f"tốc độ {wspd_kt:.0f} kt")
+    if gust_kt > 0:
+        wind_parts.append(f"giật {gust_kt:.0f} kt")
+    if wind_parts:
+        lines.append("- Gió bề mặt: " + ", ".join(wind_parts))
+
+    thermo_parts = []
+    if weather.get("temp_c") is not None:
+        thermo_parts.append(f"T={weather['temp_c']:.1f}°C")
+    if weather.get("dewpoint_c") is not None:
+        thermo_parts.append(f"Td={weather['dewpoint_c']:.1f}°C")
+    if weather.get("visibility_km") is not None:
+        thermo_parts.append(f"Tầm nhìn={weather['visibility_km']:.1f} km")
+    if cape > 0:
+        thermo_parts.append(f"CAPE={cape:.0f} J/kg")
+    if thermo_parts:
+        lines.append("- Chỉ số khí tượng: " + " | ".join(thermo_parts))
+
+    if weather.get("metar_raw"):
+        lines.append(f"- METAR: {weather['metar_raw']}")
+
+    priority_map = {5: "urgent", 4: "high", 3: "default", 2: "low", 1: "min"}
+    tags_map = {
+        5: "rotating_light,thunder_cloud_and_rain",
+        4: "warning,cloud_with_lightning_and_rain",
+        3: "umbrella,cloud_with_rain",
+        2: "eyes,partly_sunny",
+        1: "white_check_mark,airplane",
+    }
+
+    return {
+        "level": level,
+        "key": key,
+        "title": headline,
+        "body": "\n".join(lines),
+        "priority": priority_map.get(level, "default"),
+        "tags": tags_map.get(level, "partly_sunny"),
+    }
 
 
 def can_send_alert(alert: Dict[str, Any], state: Dict[str, Any], now_dt: dt.datetime) -> bool:
-    level = alert["level"]
+    level = int(alert["level"])
     key = alert["key"]
-    last_sent = state.get("last_sent", {})
-    prev_iso = last_sent.get(key)
-    if not prev_iso:
+    last_sent_map = state.get("last_sent", {})
+    last_ts_str = last_sent_map.get(key)
+    if not last_ts_str:
         return True
     try:
-        prev_dt = dt.datetime.fromisoformat(prev_iso)
+        last_dt = dt.datetime.fromisoformat(last_ts_str)
+        elapsed_min = (now_dt - last_dt).total_seconds() / 60.0
+        cooldown = COOLDOWN_MINUTES.get(level, 30)
+        return elapsed_min >= cooldown
     except Exception:
         return True
-    cooldown_min = TH["cooldown_minutes"].get(level, 20)
-    elapsed_min = (now_dt - prev_dt).total_seconds() / 60.0
-    return elapsed_min >= cooldown_min
 
 
 def send_ntfy(alert: Dict[str, Any]) -> None:
     topic = os.environ.get("NTFY_TOPIC", "").strip()
     if not topic:
-        raise RuntimeError("Chưa cấu hình biến môi trường NTFY_TOPIC.")
-    url = f"https://ntfy.sh/{topic.rstrip('/')}"
-    tags = "rotating_light,thunder_cloud_and_rain" if alert["level"] == 5 else "partly_sunny"
+        raise RuntimeError("Biến môi trường NTFY_TOPIC đang trống. Hãy kiểm tra GitHub Secrets.")
+
+    url = topic if topic.startswith("http://") or topic.startswith("https://") else f"https://ntfy.sh/{topic}"
     headers = {
         "Title": alert["title"].encode("utf-8"),
-        "Priority": alert["ntfy_priority"],
-        "Tags": tags,
+        "Priority": alert["priority"],
+        "Tags": alert["tags"],
+        "Content-Type": "text/plain; charset=utf-8",
     }
     resp = requests.post(url, data=alert["body"].encode("utf-8"), headers=headers, timeout=15)
     resp.raise_for_status()
-    print(f"[NTFY SENT] Mức {alert['level']} -> {alert['title']}")
+    print(f"[OK] Đã gửi thông báo ntfy thành công (HTTP {resp.status_code}).")
+
+
+# ==============================================================================
+# ĐIỂM VÀO CHƯƠNG TRÌNH (MAIN)
+# ==============================================================================
+def build_demo_data() -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    curr_stats = {
+        "radar": {
+            "available": True,
+            "max_dbz_15km": 46.0,
+            "mean_dbz_15km": 32.5,
+            "coverage_15km_pct": 28.0,
+            "max_dbz_30km": 50.0,
+            "coverage_30km_pct": 22.0,
+            "strongest_cell": {
+                "lat": 13.89,
+                "lon": 108.96,
+                "dbz": 46.0,
+                "distance_km": 11.4,
+                "bearing_deg": 230,
+                "direction_vi": "Tây Nam",
+            },
+            "nearest_rain_cell": {
+                "lat": 13.92,
+                "lon": 109.00,
+                "dbz": 35.0,
+                "distance_km": 5.8,
+                "bearing_deg": 230,
+                "direction_vi": "Tây Nam",
+            },
+        },
+        "ir": {
+            "available": True,
+            "min_tb_c": -61.5,
+            "mean_tb_c": -44.0,
+            "convective_status": "Mây vũ tích Cb đối lưu sâu hoạt động mạnh (-52°C đến -65°C)",
+        },
+    }
+    prev_stats = {
+        "radar": {
+            "available": True,
+            "max_dbz_15km": 38.0,
+            "strongest_cell": {
+                "lat": 13.84,
+                "lon": 108.91,
+                "dbz": 38.0,
+                "distance_km": 19.2,
+                "bearing_deg": 228,
+                "direction_vi": "Tây Nam",
+            },
+        }
+    }
+    motion = {
+        "speed_kmh": 34.0,
+        "move_dir_deg": 48,
+        "move_dir_vi": "Đông Bắc",
+        "approaching": True,
+        "eta_min": 20,
+    }
+    weather = {
+        "metar_raw": "VVPC 190500Z 23015G26KT 4000 +TSRA FEW015CB BKN080 26/24 Q1009",
+        "temp_c": 26.0,
+        "dewpoint_c": 24.0,
+        "wind_dir_deg": 230,
+        "wind_speed_kt": 15.0,
+        "wind_gust_kt": 26.0,
+        "precip_mm": 6.4,
+        "cape_jkg": 1850.0,
+        "cloud_cover_pct": 92,
+        "visibility_km": 4.0,
+        "weather_code": 95,
+    }
+    return curr_stats, prev_stats, motion, weather
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phù Cát Weather Nowcast (Radar + IR + METAR + ntfy)")
-    parser.add_argument("--demo", action="store_true", help="Chạy dữ liệu giả lập, in kết quả")
-    parser.add_argument("--dry", action="store_true", help="Chạy dữ liệu thật, chỉ in, không gửi")
-    parser.add_argument("--test", action="store_true", help="Gửi 1 tin thử qua ntfy")
+    parser = argparse.ArgumentParser(description="Phù Cát Weather Nowcast Monitor")
+    parser.add_argument("--demo", action="store_true", help="Chạy thử kịch bản dông giả lập")
+    parser.add_argument("--dry", action="store_true", help="Chạy dữ liệu thật nhưng không gửi ntfy")
     args = parser.parse_args()
 
-    now_dt = now_vn()
-
-    if args.test:
-        sample = {
-            "level": 5,
-            "key": "test_alert",
-            "ntfy_priority": "urgent",
-            "title": f"TEST CẢNH BÁO DÔNG — {STATION['name']}",
-            "body": "Tin nhắn kiểm thử kênh ntfy cho iPhone (mức 5 nổi bật).",
-        }
-        send_ntfy(sample)
-        return
-
+    tz_vn = dt.timezone(dt.timedelta(hours=7))
+    now_dt = dt.datetime.now(tz=tz_vn)
     state = load_state()
+
     prev_stats: Optional[Dict[str, Any]] = None
     motion: Optional[Dict[str, Any]] = None
 
     if args.demo:
-        demo_frames = build_demo_frames()
-        f1_dbz, f1_ct, f1_lat, f1_lon, _ = demo_frames[0]
-        f2_dbz, f2_ct, f2_lat, f2_lon, _ = demo_frames[1]
-        prev_stats = analyze_cell_grid(f1_dbz, f1_ct, f1_lat, f1_lon)
-        curr_stats = analyze_cell_grid(f2_dbz, f2_ct, f2_lat, f2_lon)
-        motion = extrapolate_motion(prev_stats.get("strongest_cell"), curr_stats.get("strongest_cell"), dt_minutes=20.0)
-        weather = {
-            "temp_c": 27.5,
-            "feels_like_c": 30.0,
-            "humidity": 84,
-            "next_3h_summary": "12:00: 28°C, mưa 60% | 13:00: 27°C, mưa 75% | 14:00: 26°C, mưa 50%",
-            "day_minmax": (24.0, 31.5),
-            "rain_hours": ["12:00 (60%)", "13:00 (75%)", "14:00 (50%)"],
-            "metar": "METAR VVPC 190400Z 11008KT 8000 -TSRA FEW018 SCT030CB 27/24 Q1009",
-        }
-        print(f"[DEMO] Prev stats: {prev_stats}")
-        print(f"[DEMO] Curr stats: {curr_stats}")
-        print(f"[DEMO] Motion: {motion}")
+        curr_stats, prev_stats, motion, weather = build_demo_data()
     else:
-        dbz_grid, ct_grid, grid_lat, grid_lon = fetch_real_radar_and_ir()
-        curr_stats = analyze_cell_grid(dbz_grid, ct_grid, grid_lat, grid_lon)
+        radar_data = fetch_rainviewer_radar()
+        ir_data = fetch_jma_ir_cloud_top()
+        curr_stats = {"radar": radar_data, "ir": ir_data}
+
         history = state.get("history", [])
         if history:
             last_entry = history[-1]
-            prev_stats =
+            prev_stats = last_entry.get("stats")
+            try:
+                prev_time = dt.datetime.fromisoformat(last_entry["timestamp"])
+                dt_min = max(1.0, (now_dt - prev_time).total_seconds() / 60.0)
+            except Exception:
+                dt_min = 10.0
+
+            prev_radar = (prev_stats or {}).get("radar", {})
+            prev_cell = prev_radar.get("strongest_cell") or prev_radar.get("nearest_rain_cell")
+            curr_cell = radar_data.get("strongest_cell") or radar_data.get("nearest_rain_cell")
+            motion = extrapolate_motion(prev_cell, curr_cell, dt_minutes=dt_min)
+
+        weather = fetch_station_weather_and_metar()
+
+    alert = evaluate_alert(curr_stats, prev_stats, motion, weather, now_dt)
+
+    if not alert:
+        print("[INFO] Thời tiết Phù Cát ổn định (không nằm trong khung gửi bản tin đầu giờ).")
+    else:
+        print(f"=== [LEVEL {alert['level']}] {alert['title']} ===")
+        print(alert["body"])
+        if not args.demo and not args.dry:
+            if can_send_alert(alert, state, now_dt):
+                send_ntfy(alert)
+                state.setdefault("last_sent", {})[alert["key"]] = now_dt.isoformat()
+            else:
+                print("[SKIP] Đang trong thời gian cooldown chống spam.")
+
+    if not args.demo and not args.dry:
+        history = state.get("history", [])
+        history.append({"timestamp": now_dt.isoformat(), "stats": curr_stats})
+        state["history"] = history[-12:]
+        save_state(state)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
