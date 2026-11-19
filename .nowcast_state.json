@@ -21,6 +21,28 @@
           "convective_status": "Quang mây hoặc mây tầng thấp ấm (>-15°C)"
         }
       }
+    },
+    {
+      "timestamp": "2026-11-19T20:58:00.825134+07:00",
+      "stats": {
+        "radar": {
+          "available": true,
+          "radar_time_utc": "2026-11-19T13:50:00+00:00",
+          "max_dbz_15km": 0.0,
+          "mean_dbz_15km": 0.0,
+          "coverage_15km_pct": 0.0,
+          "max_dbz_30km": 0.0,
+          "coverage_30km_pct": 0.0,
+          "strongest_cell": null,
+          "nearest_rain_cell": null
+        },
+        "ir": {
+          "available": true,
+          "min_tb_c": -2.4,
+          "mean_tb_c": 5.8,
+          "convective_status": "Quang mây hoặc mây tầng thấp ấm (>-15°C)"
+        }
+      }
     }
   ],
   "last_sent": {
